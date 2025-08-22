@@ -45,10 +45,11 @@ local function log(...) if LOG_ENABLED then print(table.concat({...}, " ")) end 
 -- ---------- Safe setters ----------
 local function setPM(deviceId, ptype, paramNum, midiVal)
   if midiVal < 0 then midiVal = 0 end
-  if midiVal > 16383 then midiVal = 16383 end
+  if midiVal > 127 then midiVal = 127 end
   log(string.format("setPM: device=%d type=%d param=%d value=%d", deviceId, ptype, paramNum, midiVal))
   parameterMap.set(deviceId, ptype, paramNum, midiVal)
 end
+
 
 -- ============================================================
 -- CC map (grouped by UI)
@@ -68,6 +69,7 @@ local CC = {
   -- MAIN / VCA
   AMP_VEL     = 31,
   AE_R        = 22, AE_S = 23, AE_D = 24, AE_A = 25,
+  AE_SPEED    = 62,           -- 2-state enum
 
   -- MAIN / Filter
   CUTOFF      = 74,
@@ -75,7 +77,8 @@ local CC = {
   FILT_ENV    = 17,
   FE_R        = 18, FE_S = 19, FE_D = 20, FE_A = 21,
   FILT_VEL    = 32,
-  KEYTRK      = 60,   -- 3-state enum
+  KEYTRK      = 60,           -- 3-state enum
+  FE_SPEED    = 61,           -- 2-state enum
 
   -- MAIN / Vibrato
   VIB_RATE    = 34,
@@ -93,33 +96,34 @@ local CC = {
   -- POLY-MOD
   PM_ENV_AMT  = 38,
   PM_OSCB_AMT = 39,
-  PM_FREQ     = 55,  -- destination toggles
+  MOD_DELAY   = 33,           -- modulation delay
+  PM_FREQ     = 55,           -- destination toggles
   PM_FILT     = 56,
   UNISON      = 63,
-  DETUNE      = 36,  -- unison detune
+  DETUNE      = 36,           -- unison detune
 
   -- LFO-MOD
   LFO_RATE    = 28,
   LFO_AMT     = 29,
-  LFO_SHAPE   = 57,  -- 6-step enum
-  LFO_SPEED   = 58,  -- 2-state enum
-  LFO_TARGETS = 59,  -- bitmask (see set_lfo_targets)
+  LFO_SHAPE   = 57,           -- 6-step enum
+  LFO_SPEED   = 58,           -- 2-state enum
+  LFO_TARGETS = 59,           -- bitmask (see set_lfo_targets)
 
   -- Aftertouch depths (device params)
   AT_VCA      = 41,
   AT_VCF      = 42,
 
   -- Global / performance (not recalled from SysEx)
-  BENDER_TGT  = 66,  -- 4-state enum
-  MODW_AMT    = 67,  -- 4-state enum
+  BENDER_TGT  = 66,           -- 4-state enum
+  MODW_AMT    = 67,           -- 4-state enum
   MODW_TGT    = 70,
-  VOICE_SPREAD= 77,  -- toggle (fw dep)
+  VOICE_SPREAD= 77,           -- toggle (fw dep)
   KTRK_REF    = 78,
-  GLIDE_MODE  = 79,  -- 2-state
+  GLIDE_MODE  = 79,           -- 2-state
 
   -- Addressing
-  BANK_MSB    = 0,   -- CC0 for A..D→0..3
-  PROGRAM     = 0,   -- PT_PROGRAM index (not a CC)
+  BANK_MSB    = 0,            -- CC0 for A..D→0..3
+  PROGRAM     = 0,            -- PT_PROGRAM index (not a CC)
 }
 
 -- ============================================================
@@ -184,44 +188,37 @@ local OFF = {
 -- ============================================================
 -- Helpers
 -- ============================================================
-local function set_cc_u14(cc, lo, hi) -- 2-byte unsigned (little endian) to 0..127
-  local v = (hi << 7) | lo
-  local midi = math.floor((v / 16383) * 127 + 0.5)
-  if midi > 127 then midi = 127 end
-  if midi < 0   then midi = 0   end
+-- Pair -> CC scaler (keeps your logging & flexibility)
+-- width_bits: 14 (7+7) or 16 (8+8) after unpack7to8_into()
+local function set_cc_pair(cc, lo, hi, width_bits, label)
+  if lo == nil or hi == nil then return end
+  lo = lo & 0xFF; hi = hi & 0xFF
 
+  local v
+  if width_bits == 14 then            -- legacy path (rare)
+    v = ((hi & 0x7F) << 7) | (lo & 0x7F)         -- 0..16383
+  else                                -- default: true 16-bit
+    v = (hi << 8) | lo                           -- 0..65535
+  end
+
+  -- scale to 0..127 with rounding
+  local denom = (width_bits == 14) and 16383 or 65535
+  local midi  = math.floor((v * 127) / denom + 0.5)
+  if midi < 0 then midi = 0 elseif midi > 127 then midi = 127 end
+
+  -- targeted debug logging
   if cc == CC.RESO or cc == CC.FE_A or cc == CC.FE_D or cc == CC.FE_S or cc == CC.FE_R or
      cc == CC.AE_A or cc == CC.AE_D or cc == CC.AE_S or cc == CC.AE_R then
-    log(string.format("set_cc_u14: CC%d lo=%02X hi=%02X -> v=%d -> midi=%d (clamped)", cc, lo, hi, v, midi))
+    log(string.format("pair->cc(%s): CC=%d lo=%02X hi=%02X v=%d/%d -> %d",
+      label or "", cc, lo, hi, v, denom, midi))
   end
+
   setPM(App.cfg.deviceId, PT_CC7, cc, midi)
 end
 
-local function set_toggle(cc, on)
-  setPM(App.cfg.deviceId, PT_CC7, cc, on ~= 0 and App.cfg.toggleOn or App.cfg.toggleOff)
-end
-
-local function set_enum_linear(cc, idx, steps)
-  if steps <= 1 then setPM(App.cfg.deviceId, PT_CC7, cc, 0); return end
-  if idx < 0 then idx = 0 end
-  if idx >= steps then idx = steps - 1 end
-  local step = 127.0 / (steps - 1)
-  local value = math.floor(idx * step + 0.5)
-  if value > 127 then value = 127 end
-  if value < 0   then value = 0   end
-  setPM(App.cfg.deviceId, PT_CC7, cc, value)
-end
-
-local function set_lfo_shape(cc, idx)
-  local val = math.max(0, math.min(5, idx)) * 22
-  setPM(App.cfg.deviceId, PT_CC7, cc, val)
-end
-
--- LFO targets are a bitmask in SysEx; push raw mask (0..127) to a single CC.
--- If you later split into per-target toggles, write each bit separately.
-local function set_lfo_targets(cc, mask)
-  setPM(App.cfg.deviceId, PT_CC7, cc, math.max(0, math.min(127, mask or 0)))
-end
+-- Convenience aliases so call sites stay readable
+local function set_cc_u16(cc, lo, hi, label) return set_cc_pair(cc, lo, hi, 16, label) end
+local function set_cc_u14(cc, lo, hi, label) return set_cc_pair(cc, lo, hi, 14, label) end
 
 -- Unpack Electra 7bit-packed block into 8-bit bytes
 local function unpack7to8_into(dst, syx, start_index, end_index_exclusive)
@@ -285,34 +282,40 @@ local function applyDump(sysexBlock)
   unpack7to8_into(decoded, sysexBlock, p0, end_i)
   log(string.format("Decoded %d bytes from SysEx", #decoded))
 
-  -- Osc A/B (u14)
-  set_cc_u14(CC.OSC_A_FREQ, decoded[OFF.FREQ_A] or 0, decoded[OFF.FREQ_A+1] or 0)
-  set_cc_u14(CC.OSC_A_VOL,  decoded[OFF.VOL_A]  or 0, decoded[OFF.VOL_A+1]  or 0)
-  set_cc_u14(CC.OSC_A_PW,   decoded[OFF.PWA]    or 0, decoded[OFF.PWA+1]    or 0)
-  set_cc_u14(CC.OSC_B_FREQ, decoded[OFF.FREQ_B] or 0, decoded[OFF.FREQ_B+1] or 0)
-  set_cc_u14(CC.OSC_B_VOL,  decoded[OFF.VOL_B]  or 0, decoded[OFF.VOL_B+1]  or 0)
-  set_cc_u14(CC.OSC_B_PW,   decoded[OFF.PWB]    or 0, decoded[OFF.PWB+1]    or 0)
-  set_cc_u14(CC.OSC_B_FINE, decoded[OFF.FINE_B] or 0, decoded[OFF.FINE_B+1] or 0)
+  -- Osc A/B (16-bit pairs)
+  set_cc_u16(CC.OSC_A_FREQ, decoded[OFF.FREQ_A] or 0, decoded[OFF.FREQ_A+1] or 0, "OSC_A_FREQ")
+  set_cc_u16(CC.OSC_A_VOL,  decoded[OFF.VOL_A]  or 0, decoded[OFF.VOL_A+1]  or 0, "OSC_A_VOL")
+  set_cc_u16(CC.OSC_A_PW,   decoded[OFF.PWA]    or 0, decoded[OFF.PWA+1]    or 0, "OSC_A_PW")
+  set_cc_u16(CC.OSC_B_FREQ, decoded[OFF.FREQ_B] or 0, decoded[OFF.FREQ_B+1] or 0, "OSC_B_FREQ")
+  set_cc_u16(CC.OSC_B_VOL,  decoded[OFF.VOL_B]  or 0, decoded[OFF.VOL_B+1]  or 0, "OSC_B_VOL")
+  set_cc_u16(CC.OSC_B_PW,   decoded[OFF.PWB]    or 0, decoded[OFF.PWB+1]    or 0, "OSC_B_PW")
+  set_cc_u16(CC.OSC_B_FINE, decoded[OFF.FINE_B] or 0, decoded[OFF.FINE_B+1] or 0, "OSC_B_FINE")
 
-  -- Filter / envelopes (u14)
-  set_cc_u14(CC.CUTOFF,      decoded[OFF.CUTOFF]   or 0, decoded[OFF.CUTOFF+1]   or 0)
-  set_cc_u14(CC.RESO,        decoded[OFF.RESO]     or 0, decoded[OFF.RESO+1]     or 0)
-  set_cc_u14(CC.FILT_ENV,    decoded[OFF.FILT_ENV] or 0, decoded[OFF.FILT_ENV+1] or 0)
-  set_cc_u14(CC.FE_R,        decoded[OFF.FE_R]     or 0, decoded[OFF.FE_R+1]     or 0)
-  set_cc_u14(CC.FE_S,        decoded[OFF.FE_S]     or 0, decoded[OFF.FE_S+1]     or 0)
-  set_cc_u14(CC.FE_D,        decoded[OFF.FE_D]     or 0, decoded[OFF.FE_D+1]     or 0)
-  set_cc_u14(CC.FE_A,        decoded[OFF.FE_A]     or 0, decoded[OFF.FE_A+1]     or 0)
-  set_cc_u14(CC.AE_R,        decoded[OFF.AE_R]     or 0, decoded[OFF.AE_R+1]     or 0)
-  set_cc_u14(CC.AE_S,        decoded[OFF.AE_S]     or 0, decoded[OFF.AE_S+1]     or 0)
-  set_cc_u14(CC.AE_D,        decoded[OFF.AE_D]     or 0, decoded[OFF.AE_D+1]     or 0)
-  set_cc_u14(CC.AE_A,        decoded[OFF.AE_A]     or 0, decoded[OFF.AE_A+1]     or 0)
+  -- Filter / envelopes (16-bit pairs)
+  set_cc_u16(CC.CUTOFF,      decoded[OFF.CUTOFF]   or 0, decoded[OFF.CUTOFF+1]   or 0, "CUTOFF")
+  set_cc_u16(CC.RESO,        decoded[OFF.RESO]     or 0, decoded[OFF.RESO+1]     or 0, "RESO")
+  set_cc_u16(CC.FILT_ENV,    decoded[OFF.FILT_ENV] or 0, decoded[OFF.FILT_ENV+1] or 0, "FILT_ENV")
+  set_cc_u16(CC.FE_R,        decoded[OFF.FE_R]     or 0, decoded[OFF.FE_R+1]     or 0, "FE_R")
+  set_cc_u16(CC.FE_S,        decoded[OFF.FE_S]     or 0, decoded[OFF.FE_S+1]     or 0, "FE_S")
+  set_cc_u16(CC.FE_D,        decoded[OFF.FE_D]     or 0, decoded[OFF.FE_D+1]     or 0, "FE_D")
+  set_cc_u16(CC.FE_A,        decoded[OFF.FE_A]     or 0, decoded[OFF.FE_A+1]     or 0, "FE_A")
+  set_cc_u16(CC.AE_R,        decoded[OFF.AE_R]     or 0, decoded[OFF.AE_R+1]     or 0, "AE_R")
+  set_cc_u16(CC.AE_S,        decoded[OFF.AE_S]     or 0, decoded[OFF.AE_S+1]     or 0, "AE_S")
+  set_cc_u16(CC.AE_D,        decoded[OFF.AE_D]     or 0, decoded[OFF.AE_D+1]     or 0, "AE_D")
+  set_cc_u16(CC.AE_A,        decoded[OFF.AE_A]     or 0, decoded[OFF.AE_A+1]     or 0, "AE_A")
 
-  -- LFO / dynamics (u14)
-  set_cc_u14(CC.LFO_RATE,    decoded[OFF.LFO_FREQ] or 0, decoded[OFF.LFO_FREQ+1] or 0)
-  set_cc_u14(CC.LFO_AMT,     decoded[OFF.LFO_AMT]  or 0, decoded[OFF.LFO_AMT+1]  or 0)
-  set_cc_u14(CC.GLIDE,       decoded[OFF.GLIDE]    or 0, decoded[OFF.GLIDE+1]    or 0)
-  set_cc_u14(CC.AMP_VEL,     decoded[OFF.AMP_VEL]  or 0, decoded[OFF.AMP_VEL+1]  or 0)
-  set_cc_u14(CC.FILT_VEL,    decoded[OFF.FILT_VEL] or 0, decoded[OFF.FILT_VEL+1] or 0)
+  -- LFO / dynamics (16-bit pairs)
+  set_cc_u16(CC.LFO_RATE,    decoded[OFF.LFO_FREQ] or 0, decoded[OFF.LFO_FREQ+1] or 0, "LFO_RATE")
+  set_cc_u16(CC.LFO_AMT,     decoded[OFF.LFO_AMT]  or 0, decoded[OFF.LFO_AMT+1]  or 0, "LFO_AMT")
+  set_cc_u16(CC.GLIDE,       decoded[OFF.GLIDE]    or 0, decoded[OFF.GLIDE+1]    or 0, "GLIDE")
+  set_cc_u16(CC.AMP_VEL,     decoded[OFF.AMP_VEL]  or 0, decoded[OFF.AMP_VEL+1]  or 0, "AMP_VEL")
+  set_cc_u16(CC.FILT_VEL,    decoded[OFF.FILT_VEL] or 0, decoded[OFF.FILT_VEL+1] or 0, "FILT_VEL")
+
+  -- Vibrato / delay / detune (16-bit pairs)
+  set_cc_u16(CC.MOD_DELAY,   decoded[OFF.MOD_DELAY] or 0, decoded[OFF.MOD_DELAY+1] or 0, "MOD_DELAY")
+  set_cc_u16(CC.VIB_RATE,    decoded[OFF.VIB_SPEED] or 0, decoded[OFF.VIB_SPEED+1] or 0, "VIB_RATE")
+  set_cc_u16(CC.VIB_AMT,     decoded[OFF.VIB_AMT]   or 0, decoded[OFF.VIB_AMT+1]   or 0, "VIB_AMT")
+  set_cc_u16(CC.DETUNE,      decoded[OFF.DETUNE]    or 0, decoded[OFF.DETUNE+1]    or 0, "DETUNE")
 
   -- Waveforms / Poly-Mod destinations (toggles)
   set_toggle(CC.A_SAW,       decoded[OFF.A_SAW] or 0)
@@ -330,6 +333,8 @@ local function applyDump(sysexBlock)
   set_lfo_shape(CC.LFO_SHAPE,   decoded[OFF.LFO_SHAPE] or 0)  -- 0..5 → spaced in 0..127
   set_enum_linear(CC.LFO_SPEED,  decoded[OFF.LFO_RANGE] or 0, 2)
   set_enum_linear(CC.KEYTRK,     decoded[OFF.KEYTRK]    or 0, 3)
+  set_enum_linear(CC.FE_SPEED,    decoded[OFF.FE_SPEED]  or 0, 2)
+  set_enum_linear(CC.AE_SPEED,    decoded[OFF.AE_SPEED]  or 0, 2)
   set_enum_linear(CC.BENDER_TGT, decoded[OFF.PB_TARGET] or 0, 4)
   set_enum_linear(CC.MODW_AMT,   decoded[OFF.MODW_AMT]  or 0, 4)
   set_enum_linear(CC.GLIDE_MODE, decoded[OFF.GLIDE_MODE] or 0, 2)
@@ -340,12 +345,12 @@ local function applyDump(sysexBlock)
   -- Optional / firmware-dependent fields
   if decoded[OFF.VOICE_SPREAD] ~= nil then set_toggle(CC.VOICE_SPREAD, decoded[OFF.VOICE_SPREAD] or 0) end
 
-  -- Additional continuous fields (u14) when CCs are exposed
-  set_cc_u14(CC.NOISE,       decoded[OFF.NOISE]   or 0, decoded[OFF.NOISE+1]   or 0)
-  set_cc_u14(CC.PM_ENV_AMT,  decoded[OFF.PM_ENV]  or 0, decoded[OFF.PM_ENV+1]  or 0)
-  set_cc_u14(CC.PM_OSCB_AMT, decoded[OFF.PM_OSCB] or 0, decoded[OFF.PM_OSCB+1] or 0)
-  set_cc_u14(CC.AT_VCA,      decoded[OFF.VCA_AT]  or 0, decoded[OFF.VCA_AT+1]  or 0)
-  set_cc_u14(CC.AT_VCF,      decoded[OFF.VCF_AT]  or 0, decoded[OFF.VCF_AT+1]  or 0)
+  -- Additional continuous fields (16-bit pairs)
+  set_cc_u16(CC.NOISE,       decoded[OFF.NOISE]   or 0, decoded[OFF.NOISE+1]   or 0, "NOISE")
+  set_cc_u16(CC.PM_ENV_AMT,  decoded[OFF.PM_ENV]  or 0, decoded[OFF.PM_ENV+1]  or 0, "PM_ENV_AMT")
+  set_cc_u16(CC.PM_OSCB_AMT, decoded[OFF.PM_OSCB] or 0, decoded[OFF.PM_OSCB+1] or 0, "PM_OSCB_AMT")
+  set_cc_u16(CC.AT_VCA,      decoded[OFF.VCA_AT]  or 0, decoded[OFF.VCA_AT+1]  or 0, "AT_VCA")
+  set_cc_u16(CC.AT_VCF,      decoded[OFF.VCF_AT]  or 0, decoded[OFF.VCF_AT+1]  or 0, "AT_VCF")
   -- PB_RANGE present at OFF.PB_RANGE but no CC assigned here.
 
   info.setText("Patch loaded successfully!")
